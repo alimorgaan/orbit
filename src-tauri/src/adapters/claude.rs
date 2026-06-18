@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
-use super::{AgentAdapter, SessionLocation};
+use super::{AgentAdapter, PlatformPaths, SessionLocation};
 use crate::models::*;
 
 pub struct ClaudeAdapter;
@@ -18,29 +18,42 @@ impl ClaudeAdapter {
         Self
     }
 
+    pub(crate) fn windows_projects_root(paths: &PlatformPaths) -> Option<PathBuf> {
+        paths.home_join(".claude/projects")
+    }
+
+    pub(crate) fn windows_resume_command(session_id: &str, project_path: &str) -> String {
+        let safe_path = crate::shell_quote::shell_quote(project_path);
+        let safe_session = crate::shell_quote::shell_quote(session_id);
+        format!(
+            "Set-Location {}; claude --resume {}",
+            safe_path, safe_session
+        )
+    }
+
+    fn project_dirs_from_projects_dir(projects_dir: &Path) -> Vec<PathBuf> {
+        if !projects_dir.is_dir() {
+            return Vec::new();
+        }
+
+        std::fs::read_dir(projects_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect()
+    }
+
     fn project_dirs(&self) -> Vec<PathBuf> {
-        if cfg!(target_os = "macos") {
-            let home = dirs::home_dir().unwrap_or_default();
-            let claude_dir = home.join(".claude").join("projects");
-            if claude_dir.exists() {
-                let mut dirs = Vec::new();
-                if let Ok(entries) = std::fs::read_dir(&claude_dir) {
-                    for entry in entries.flatten() {
-                        if entry.path().is_dir() {
-                            dirs.push(entry.path());
-                        }
-                    }
-                }
-                dirs
-            } else {
-                Vec::new()
-            }
-        } else if cfg!(target_os = "linux") {
-            // To be implemented.
-            Vec::new()
+        if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+            dirs::home_dir()
+                .map(|home| Self::project_dirs_from_projects_dir(&home.join(".claude/projects")))
+                .unwrap_or_default()
         } else if cfg!(target_os = "windows") {
-            // To be implemented.
-            Vec::new()
+            Self::windows_projects_root(&PlatformPaths::system())
+                .map(|root| Self::project_dirs_from_projects_dir(&root))
+                .unwrap_or_default()
         } else {
             Vec::new()
         }
@@ -58,15 +71,10 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     async fn detect(&self) -> bool {
-        if cfg!(target_os = "macos") {
-            let home = dirs::home_dir().unwrap_or_default();
-            home.join(".claude").exists()
-        } else if cfg!(target_os = "linux") {
-            // To be implemented.
-            false
+        if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+            dirs::home_dir().is_some_and(|home| home.join(".claude").exists())
         } else if cfg!(target_os = "windows") {
-            // To be implemented.
-            false
+            Self::windows_projects_root(&PlatformPaths::system()).is_some_and(|path| path.is_dir())
         } else {
             false
         }
@@ -380,6 +388,10 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     fn resume_command(&self, session_id: &str, project_path: &str) -> String {
+        if cfg!(target_os = "windows") {
+            return Self::windows_resume_command(session_id, project_path);
+        }
+
         let safe_path = crate::shell_quote::shell_quote(project_path);
         let safe_session = crate::shell_quote::shell_quote(session_id);
         format!("cd {} && claude --resume {}", safe_path, safe_session)
@@ -457,6 +469,26 @@ mod tests {
         let path = project_dir.join(format!("{}.jsonl", name));
         fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn project_dirs_from_projects_dir_returns_only_direct_project_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects_dir = tmp.path().join("projects");
+        let project_a = projects_dir.join("project-a");
+        let project_b = projects_dir.join("project-b");
+        let nested_session_dir = project_a.join("session-1");
+        let nested_subagents_dir = nested_session_dir.join("subagents");
+
+        fs::create_dir_all(&project_a).unwrap();
+        fs::create_dir_all(&project_b).unwrap();
+        fs::create_dir_all(&nested_subagents_dir).unwrap();
+        fs::write(projects_dir.join("not-a-project.jsonl"), "{}").unwrap();
+
+        let mut dirs = ClaudeAdapter::project_dirs_from_projects_dir(&projects_dir);
+        dirs.sort();
+
+        assert_eq!(dirs, vec![project_a, project_b]);
     }
 
     #[tokio::test]
